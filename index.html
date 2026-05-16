@@ -249,7 +249,7 @@ nav.tabs { display: flex; gap: 4px; margin-bottom: 32px; border-bottom: 1px soli
 <script src="https://unpkg.com/leaflet.heat@0.2.0/dist/leaflet-heat.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <script type="module">
-import FitParser from 'https://esm.sh/fit-file-parser@1.21.0';
+import { Decoder, Stream } from 'https://esm.sh/@garmin/fitsdk@21.202.0';
 
 // ============ STATE ============
 const state = {
@@ -315,54 +315,52 @@ async function loadSettingsKV() {
   });
 }
 
-// ============ FIT PARSING ============
-function parseFitFile(file) {
-  return new Promise((resolve, reject) => {
-    const parser = new FitParser({
-      force: true,
-      speedUnit: 'km/h',
-      lengthUnit: 'km',
-      temperatureUnit: 'celsius',
-      elapsedRecordField: true,
-      mode: 'cascade',
-    });
-    const reader = new FileReader();
-    reader.onload = (e) => {
-      parser.parse(e.target.result, (err, data) => {
-        if (err) return reject(err);
-        resolve(processFitData(data, file.name));
-      });
-    };
-    reader.onerror = reject;
-    reader.readAsArrayBuffer(file);
+// ============ FIT PARSING (using Garmin's official FIT SDK) ============
+async function parseFitFile(file) {
+  const buffer = await file.arrayBuffer();
+  const stream = Stream.fromArrayBuffer(buffer);
+  const decoder = new Decoder(stream);
+  if (!decoder.isFIT()) throw new Error('Not a valid FIT file');
+  if (!decoder.checkIntegrity()) console.warn(`${file.name}: integrity check failed, attempting parse anyway`);
+  const { messages, errors } = decoder.read({
+    applyScaleAndOffset: true,
+    expandSubFields: true,
+    expandComponents: true,
+    convertTypesToStrings: true,
+    convertDateTimesToDates: true,
+    includeUnknownData: false,
+    mergeHeartRates: false,
   });
+  if (errors && errors.length > 0) {
+    console.warn(`${file.name} parse warnings:`, errors);
+  }
+  return processFitData(messages, file.name);
 }
 
-function processFitData(data, filename) {
-  // Extract all trackpoints from sessions/laps/records
+function processFitData(messages, filename) {
+  const recordMesgs = messages.recordMesgs || [];
   const records = [];
-  function walk(obj) {
-    if (!obj || typeof obj !== 'object') return;
-    if (Array.isArray(obj)) { obj.forEach(walk); return; }
-    if (obj.position_lat != null && obj.position_long != null && obj.timestamp) {
-      records.push({
-        t: new Date(obj.timestamp).getTime(),
-        lat: obj.position_lat,
-        lng: obj.position_long,
-        hr: obj.heart_rate ?? null,
-        cad: obj.cadence ?? null,
-        spd: obj.speed ?? null,
-        alt: obj.altitude ?? obj.enhanced_altitude ?? null,
-        dist: obj.distance ?? null,
-      });
-    }
-    for (const k in obj) if (typeof obj[k] === 'object') walk(obj[k]);
+  const SEMICIRCLE_TO_DEG = 180 / 2147483648; // 180 / 2^31
+
+  for (const r of recordMesgs) {
+    if (r.positionLat == null || r.positionLong == null) continue;
+    const t = r.timestamp instanceof Date ? r.timestamp.getTime() : new Date(r.timestamp).getTime();
+    if (!Number.isFinite(t)) continue;
+    records.push({
+      t,
+      lat: r.positionLat * SEMICIRCLE_TO_DEG,
+      lng: r.positionLong * SEMICIRCLE_TO_DEG,
+      hr: r.heartRate ?? null,
+      cad: r.cadence ?? null,
+      spd: (r.enhancedSpeed ?? r.speed) != null ? (r.enhancedSpeed ?? r.speed) * 3.6 : null, // m/s → km/h
+      alt: r.enhancedAltitude ?? r.altitude ?? null,
+      dist: r.distance != null ? r.distance / 1000 : null, // m → km
+    });
   }
-  walk(data);
 
   records.sort((a, b) => a.t - b.t);
 
-  if (records.length === 0) throw new Error(`No GPS records in ${filename}`);
+  if (records.length === 0) throw new Error(`No GPS records found in ${filename}`);
 
   const start = records[0].t;
   const end = records[records.length - 1].t;
@@ -383,11 +381,16 @@ function processFitData(data, filename) {
     }
   }
 
+  // Try to grab a nicer name from session message
+  let name = filename.replace(/\.fit$/i, '');
+  const session = messages.sessionMesgs && messages.sessionMesgs[0];
+  if (session && session.sport) name = `${session.sport.charAt(0).toUpperCase()}${session.sport.slice(1)} · ${name}`;
+
   const id = `${start}-${Math.round(distance * 1000)}`;
 
   return {
     id,
-    name: filename.replace(/\.fit$/i, ''),
+    name,
     date: start,
     duration: durationS,
     distance,
@@ -445,16 +448,21 @@ async function handleFiles(fileList) {
   if (files.length === 0) return toast('No .fit files found', true);
   progress.innerHTML = `<div>Parsing 0 / ${files.length}…</div><div class="bar"><div class="bar-fill" style="width:0%"></div></div>`;
   let ok = 0, fail = 0;
+  const failedFiles = [];
   for (let i = 0; i < files.length; i++) {
     try {
-      const ride = await parseFitFile(files[i]);
-      // dedup by id
+      // 30-second timeout per file — guards against silent hangs
+      const ride = await Promise.race([
+        parseFitFile(files[i]),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('Parse timeout (30s)')), 30000)),
+      ]);
       const existing = state.rides.findIndex(r => r.id === ride.id);
       if (existing >= 0) state.rides[existing] = ride; else state.rides.push(ride);
       await saveRide(ride);
       ok++;
     } catch (err) {
-      console.error('parse err', files[i].name, err);
+      console.error(`Parse error for ${files[i].name}:`, err);
+      failedFiles.push({ name: files[i].name, error: err.message || String(err) });
       fail++;
     }
     const pct = ((i + 1) / files.length) * 100;
@@ -462,8 +470,12 @@ async function handleFiles(fileList) {
   }
   state.rides.sort((a, b) => b.date - a.date);
   updateCounter();
-  progress.innerHTML = `<div>Done — ${ok} rides parsed${fail ? `, ${fail} failed` : ''}.</div>`;
-  toast(`Loaded ${ok} ride${ok === 1 ? '' : 's'}`);
+  let summary = `Done — ${ok} ride${ok === 1 ? '' : 's'} parsed${fail ? `, ${fail} failed` : ''}.`;
+  if (failedFiles.length > 0) {
+    summary += `<div style="margin-top:12px; padding:12px; background: rgba(255,94,58,0.08); border-left: 2px solid var(--accent-2); font-size: 12px; color: var(--text-dim);">Failed files (check browser console for full details):<br>${failedFiles.slice(0, 5).map(f => `<strong>${f.name}</strong>: ${f.error}`).join('<br>')}${failedFiles.length > 5 ? `<br>…and ${failedFiles.length - 5} more` : ''}</div>`;
+  }
+  progress.innerHTML = summary;
+  if (ok > 0) toast(`Loaded ${ok} ride${ok === 1 ? '' : 's'}`);
 }
 
 function updateCounter() {
@@ -838,6 +850,17 @@ function toast(msg, isError = false) {
 }
 
 // ============ INIT ============
+window.addEventListener('error', (e) => {
+  console.error('Global error:', e.error || e.message);
+  const p = document.getElementById('progress');
+  if (p && !p.innerHTML.includes('error')) {
+    p.innerHTML = `<div style="color: var(--accent-2);">Error: ${e.message}. Check the browser console (F12 → Console) for details.</div>`;
+  }
+});
+window.addEventListener('unhandledrejection', (e) => {
+  console.error('Unhandled promise rejection:', e.reason);
+});
+
 (async function init() {
   db = await openDB();
   document.getElementById('storage-mode').textContent = db ? 'persistent' : 'memory only';
@@ -851,6 +874,13 @@ function toast(msg, isError = false) {
       document.getElementById('weight').value = s.weight;
     }
     updateCounter();
+  }
+  // Verify FIT SDK actually loaded
+  if (typeof Decoder !== 'function') {
+    console.error('FIT SDK failed to load — Decoder is not a function');
+    document.getElementById('progress').innerHTML = `<div style="color: var(--accent-2);">⚠️ FIT parser library failed to load. Check your internet connection and reload the page.</div>`;
+  } else {
+    console.log('Ride Log ready · FIT SDK loaded');
   }
 })();
 </script>
